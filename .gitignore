@@ -1,0 +1,51 @@
+## C++ build artifacts
+build/
+cmake-build-*/
+out/
+bin/
+obj/
+Debug/
+Release/
+x64/
+x86/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+## CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+
+## IDE files
+.vscode/
+.idea/
+*.user
+*.suo
+*.vcxproj.user
+
+## Debugger and generated files
+*.dSYM/
+*.stackdump
+*.gdb_history
+*.log
+*.tmp
+
+## Editor and OS files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
