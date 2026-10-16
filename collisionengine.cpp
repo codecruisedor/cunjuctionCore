@@ -18,6 +18,12 @@ struct Candidate {
     std::size_t minIndex;
     double distance;
 };
+struct Conjunction {
+    std::size_t first,second;
+    libsgp4::DateTime timeOfClosestApproach;
+    double missDistance;
+    double relativeSpeed;
+};
 struct TLEData
 {
     std::string name;
@@ -81,7 +87,8 @@ std::vector<Candidate> screenPairs(
 
             // scan for sampled local minima
             for (std::size_t k = 1; k + 1 < steps; ++k) {
-                if (!(d2[k] <= d2[k - 1] && d2[k] < d2[k + 1])) continue;
+                if (!(d2[k] <= d2[k - 1] && d2[k] < d2[k + 1])) 
+                    continue;
 
                 // gate: is this dip worth refining?
                 const libsgp4::Vector* vi = &velocities[i * steps];
@@ -99,6 +106,98 @@ std::vector<Candidate> screenPairs(
     return candidates;
 }
 
+inline bool stateAt(const libsgp4::SGP4& sgp4, const libsgp4::DateTime& t,
+                    libsgp4::Vector& r, libsgp4::Vector& v) {
+    try {
+        const libsgp4::Eci eci = sgp4.FindPosition(t);
+        r = eci.Position();
+        v = eci.Velocity();
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+// Squared distance between two objects at `secondsFromStart`.
+// Returns infinity if either propagation fails.
+inline double pairDistSq(const libsgp4::SGP4& a, const libsgp4::SGP4& b,
+                         const libsgp4::DateTime& start, double secondsFromStart) {
+    libsgp4::Vector rX, vY, rZ, vW;
+    const libsgp4::DateTime t = start.AddSeconds(secondsFromStart);
+    if (!stateAt(a, t, rX, vY) || !stateAt(b, t, rZ, vW))
+        return std::numeric_limits<double>::infinity();
+    return distSq(rX, rZ);  // the helper from screenPairs
+}
+
+std::optional<Conjunction> refineCandidate(
+    const Candidate& c,
+    const std::vector<libsgp4::SGP4>& propagators,
+    const libsgp4::DateTime& start,
+    double stepSeconds,
+    double thresholdKm,
+    double toleranceSeconds = 1e-3)
+{
+    const libsgp4::SGP4& A = propagators[c.first];
+    const libsgp4::SGP4& B = propagators[c.second];
+
+    constexpr double invPhi = 0.6180339887498949;  // 1 / golden ratio
+
+    // Bracket: the samples on either side of the sampled minimum
+    double lo = static_cast<double>(c.minIndex - 1) * stepSeconds;
+    double hi = static_cast<double>(c.minIndex + 1) * stepSeconds;
+
+    double x1 = hi - invPhi * (hi - lo);
+    double x2 = lo + invPhi * (hi - lo);
+    
+    double f1 = pairDistSq(A, B, start, x1);
+    double f2 = pairDistSq(A, B, start, x2);
+
+    while (hi - lo > toleranceSeconds) {
+        if (f1 < f2) {              // minimum is in [lo, x2]
+            hi = x2;
+            x2 = x1;
+            f2 = f1;       // reuse the old probe
+            x1 = hi - invPhi * (hi - lo);
+            f1 = pairDistSq(A, B, start, x1);
+        } else {                    // minimum is in [x1, hi]
+            lo = x1;
+            x1 = x2;
+            f1 = f2;       // reuse the old probe
+            x2 = lo + invPhi * (hi - lo);
+            f2 = pairDistSq(A, B, start, x2);
+        }
+    }
+
+    const double sTca = 0.5 * (lo + hi);
+    const libsgp4::DateTime tca = start.AddSeconds(sTca);
+
+    libsgp4::Vector ra, va, rb, vb;
+    if (!stateAt(A, tca, ra, va) || !stateAt(B, tca, rb, vb))
+        return std::nullopt;
+
+    const double miss = std::sqrt(distSq(ra, rb));
+    if (miss > thresholdKm) return std::nullopt;  // the strict test
+
+    return Conjunction{c.first, c.second, tca, miss, speed(va, vb)};
+}
+
+std::vector<Conjunction> refineAll(
+    const std::vector<Candidate>& candidates,
+    const std::vector<libsgp4::SGP4>& propagators,
+    const libsgp4::DateTime& start,
+    double stepSeconds,
+    double thresholdKm)
+{
+    std::vector<Conjunction> out;
+    for (const auto& c : candidates) {
+        if (auto conj = refineCandidate(c, propagators, start, stepSeconds, thresholdKm))
+            out.push_back(*conj);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const Conjunction& a, const Conjunction& b) { return a.missDistance < b.missDistance; });
+    return out;
+}
+
 int main()
 {
     auto start = std::chrono::high_resolution_clock::now();
@@ -110,7 +209,7 @@ int main()
     httplib::Client cli("http://celestrak.org");
 
     // actual TLE fetching
-    if (auto res = cli.Get("/NORAD/elements/gp.php?GROUP=planet&FORMAT=TLE"))
+    if (auto res = cli.Get("/NORAD/elements/gp.php?GROUP=satnogs&FORMAT=TLE"))
     {
         std::string tleFirst = "";
         std::string tleSecond = "";
@@ -120,35 +219,28 @@ int main()
         std::cout << "GET request successful!" << std::endl;
         std::cout << "Response status: " << res->status << std::endl;
         // std::cout << "Response body: " << res->body << std::endl;
-        for (int u = 0; u < res->body.size(); u++)
-        {
-            if (res->body[u] == '\n')
-            {
-                std::cout << "Newline found at index: " << u << std::endl;
-            }
-        }
-        for (int i = 0; i < res->body.size();)
-        {
-            if (threeDone == 3)
-            {
-                threeDone = 0;
+        // for (int u = 0; u < res->body.size(); u++)
+        // {
+        //     // if (res->body[u] == '\n')
+        //     // {
+        //     //     std::cout << "Newline found at index: " << u << std::endl;
+        //     // }
+        // }
+        for (int i = 0; i < res->body.size();) {
+            if (threeDone == 3){
+                 threeDone = 0;
             }
             int j = i;
-            while (j < res->body.size() && res->body[j] != '\n')
-            {
+            while (j < res->body.size() && res->body[j] != '\n'){
                 j++;
-            }
+            }   
             threeDone++;
-            if (threeDone == 1)
-            {
-                tleFirst = res->body.substr(i, j - i);
-               // std::cout << "TLE First Line: " << tleFirst << std::endl;
+            if (threeDone == 1){
+                tleFirst  =  res->body.substr(i, j - i);
             }
-            else if (threeDone == 2)
-            {
-                tleSecond = res->body.substr(i, j - i);
-               // std::cout << "TLE Second Line: " << tleSecond << std::endl;
-            }
+            else if (threeDone == 2){
+                tleSecond =  res->body.substr(i, j - i);
+            }    
             else if (threeDone == 3)
             {
                 tleThird = res->body.substr(i, j - i);
@@ -156,15 +248,14 @@ int main()
                 TLEData tleData;
                 if (tleNameToIndex.find(tleFirst) != tleNameToIndex.end()) {
                     std::cout << "Duplicate TLE name found: " << tleFirst << std::endl;
-                    // Handle the duplicate case as needed (e.g., skip, overwrite, etc.)
-                    continue; // Skip this TLE and move to the next one
+                   // continue; // Skip this TLE and move to the next one
                 } else {
                     tleNameToIndex[tleFirst] = static_cast<std::int16_t>(tleDataList.size());
+                    tleData.name = tleFirst;
+                    tleData.line1 = tleSecond.substr(0,69);
+                    tleData.line2 = tleThird.substr(0,69);
+                    tleDataList.push_back(tleData);
                 }
-                tleData.name = tleFirst; // You can set this to a meaningful name if available
-                tleData.line1 = tleSecond.substr(0,69);
-                tleData.line2 = tleThird.substr(0,69);
-                tleDataList.push_back(tleData);
             }
             i = j + 1; // Move past the newline character
         }
@@ -174,6 +265,9 @@ int main()
         std::cout << "SIZE : " << tleDataList.size();
         
         for (const auto &t : tleDataList) {
+            std::cout << "Satellite Name: " << t.name << std::endl;
+            std::cout << "Line 1: " << t.line1 << std::endl;
+            std::cout << "Line 2: " << t.line2 << std::endl;
             libsgp4::Tle tle(t.name, t.line1, t.line2); 
             libsgp4::SGP4 sgp4(tle);
             propagators.emplace_back(tle);
@@ -181,7 +275,7 @@ int main()
 
         // shared window: same start time and step for every object
         libsgp4::DateTime start = libsgp4::DateTime::Now(true); // true = UTC
-        const double stepSeconds = 30.0;
+        const double stepSeconds = 5.0;
         const double windowHours = 24.0;
         const std::size_t steps = static_cast<std::size_t>(windowHours * 3600.0 / stepSeconds) + 1;
 
@@ -215,10 +309,15 @@ int main()
         auto propDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endProp - startProp);
         std::cout << "Propagation time: " << propDuration.count() << " milliseconds" << std::endl;
         std::cout << "Propagation position size : " << totalPropgationSteps << std::endl;
+        const double thresholdKm = 25.0; // Define the threshold for conjunctions
 
-        
+        //call refineAll to get the conjunctions
+        auto conjunctions = refineAll(candidates, propagators, start, stepSeconds, thresholdKm);
 
-
+        std::cout << conjunctions.size() << " conjunctions found" << std::endl;
+        for (const auto& conj : conjunctions) {
+            std::cout << "Conjunction between objects " << conj.first << " and " << conj.second << " at time " << conj.timeOfClosestApproach.ToString() << " with miss distance " << conj.missDistance << " km and relative speed " << conj.relativeSpeed << " km/s" << std::endl;
+        }
         // std::cout << "Position (ECI): " << pos.ToString() << std::endl;
     }
     else
@@ -228,5 +327,8 @@ int main()
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     std::cout << "Execution time: " << duration.count() << " milliseconds" << std::endl;
+
+   
+   
     return 0;
 }
