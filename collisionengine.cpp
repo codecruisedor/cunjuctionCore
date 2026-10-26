@@ -1,14 +1,23 @@
 #include "httplib.h"
 #include <vector>
-#include "rapidjson/document.h"
-#include "rapidjson/writer.h"
-#include "rapidjson/stringbuffer.h"
+// #include "rapidjson/document.h"
+// #include "rapidjson/writer.h"
+// #include "rapidjson/stringbuffer.h"
 #include <iostream>
 #include <chrono>
 #include <libsgp4/SGP4.h>
 #include <libsgp4/Vector.h>
 #include <cmath>
 #include <cstddef>
+#include <libsgp4/Vector.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+std::set<std::pair<std::size_t, std::size_t>> unique_pairs;
 
 void createEarth() {
 
@@ -31,21 +40,21 @@ struct TLEData
     std::string line2;
 };
 
-rapidjson::GenericArray<false, rapidjson::Value> parseJson(const std::string &jsonStr)
-{
-    rapidjson::Document doc;
-    doc.Parse(jsonStr.c_str());
+// rapidjson::GenericArray<false, rapidjson::Value> parseJson(const std::string &jsonStr)
+// {
+//     rapidjson::Document doc;
+//     doc.Parse(jsonStr.c_str());
 
-    if (doc.HasParseError())
-    {
-        std::cout << "Error parsing JSON" << std::endl;
-        // return rapidjson::GenericArray<false, rapidjson::Value>(); // Return an empty array on parse error
-    }
+//     if (doc.HasParseError())
+//     {
+//         std::cout << "Error parsing JSON" << std::endl;
+//         // return rapidjson::GenericArray<false, rapidjson::Value>(); // Return an empty array on parse error
+//     }
 
-    // std::cout << "Number of elements in JSON array: " << doc.GetArray().Size() << std::endl;
-    const auto &data = doc.GetArray();
-    return data;
-}
+//     // std::cout << "Number of elements in JSON array: " << doc.GetArray().Size() << std::endl;
+//     const auto &data = doc.GetArray();
+//     return data;
+// }
 
 // void parseJson(const std::string &jsonStr);
 inline double distSq(const libsgp4::Vector& a, const libsgp4::Vector& b) {
@@ -53,9 +62,80 @@ inline double distSq(const libsgp4::Vector& a, const libsgp4::Vector& b) {
     return dx * dx + dy * dy + dz * dz;
 }
 
+
 inline double speed(const libsgp4::Vector& va, const libsgp4::Vector& vb) {
     const double dx = va.x - vb.x, dy = va.y - vb.y, dz = va.z - vb.z;
     return std::sqrt(dx * dx + dy * dy + dz * dz); // km/s
+}
+
+// this packs the three cell coordinates into a single 64-bit integer, with an offset to allow negative coordinates
+inline std::uint64_t cellKey(int cx, int cy, int cz) {
+    constexpr int offset = 1 << 20;
+    std::uint64_t cellkey = (std::uint64_t(cx + offset) << 42) | (std::uint64_t(cy + offset) << 21) | std::uint64_t(cz + offset);
+    return cellkey;
+}
+
+inline std::uint64_t packPair(std::size_t i, std::size_t j) {  // requires i < j
+    return (std::uint64_t(i) << 32) | std::uint64_t(j);
+}
+
+// Worst-case gate radius. Any pair's relative speed is at most 2 x the fastest
+// object, so this never underestimates the gate used in screenPairs.
+inline double maxGateKm(const std::vector<libsgp4::Vector>& velocities, const std::vector<char>& valid,
+                        double stepSeconds, double thresholdKm, double marginKm) {
+    double vmax = 0.0;
+    for (std::size_t q = 0; q < velocities.size(); ++q) {
+        if (!valid[q]) continue;
+        const auto& v = velocities[q];
+        vmax = std::max(vmax, std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z));
+    }
+    const double s = 2.0 * vmax * stepSeconds * 0.5;
+    return std::sqrt(thresholdKm * thresholdKm + s * s) + marginKm;
+}
+
+// Every pair (i<j) that is within radiusKm at ANY grid sample.
+std::unordered_set<std::uint64_t> candidatePairs(const std::vector<libsgp4::Vector>& positions,
+                                                 const std::vector<char>& valid, std::size_t n,
+                                                 std::size_t steps, double radiusKm) {
+    std::unordered_set<std::uint64_t> pairs;
+    std::unordered_map<std::uint64_t, std::vector<std::size_t>> grid;
+    std::vector<int> cx(n), cy(n), cz(n);
+    const double r2 = radiusKm * radiusKm;
+
+    for (std::size_t k = 0; k < steps; ++k) {
+        grid.clear();
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!valid[i * steps + k]) continue;
+
+            const auto& p = positions[i * steps + k];
+
+            cx[i] = static_cast<int>(std::floor(p.x / radiusKm));
+            cy[i] = static_cast<int>(std::floor(p.y / radiusKm));
+            cz[i] = static_cast<int>(std::floor(p.z / radiusKm));
+
+            grid[cellKey(cx[i], cy[i], cz[i])].push_back(i);
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+
+            if (!valid[i * steps + k]) continue;
+
+            const auto& pi = positions[i * steps + k];
+
+                for (int dx = -1; dx <= 1; ++dx)
+                for (int dy = -1; dy <= 1; ++dy)
+                
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        auto it = grid.find(cellKey(cx[i] + dx, cy[i] + dy, cz[i] + dz));
+                        if (it == grid.end()) continue;
+                        for (std::size_t j : it->second) {
+                            if (j <= i) continue;                                  // each pair once
+                            if (distSq(pi, positions[j * steps + k]) > r2) continue;
+                            pairs.insert(packPair(i, j));
+                        }
+                    }
+        }
+    }
+    return pairs;
 }
 
 std::vector<Candidate> screenPairs(
@@ -129,14 +209,41 @@ inline double pairDistSq(const libsgp4::SGP4& a, const libsgp4::SGP4& b,
     return distSq(rX, rZ);  // the helper from screenPairs
 }
 
+
+void screenOnePair(std::size_t i, std::size_t j,
+                   const std::vector<libsgp4::Vector>& positions,
+                   const std::vector<libsgp4::Vector>& velocities,
+                   const std::vector<char>& valid, std::size_t steps,
+                   double stepSeconds, double thr2, double gateMarginKm,
+                   std::vector<double>& d2, std::vector<Candidate>& out)
+{
+    const libsgp4::Vector* ri = &positions[i * steps];
+    const libsgp4::Vector* rj = &positions[j * steps];
+    const libsgp4::Vector* vi = &velocities[i * steps];
+    const libsgp4::Vector* vj = &velocities[j * steps];
+    const char* oi = &valid[i * steps];
+    const char* oj = &valid[j * steps];
+
+    for (std::size_t k = 0; k < steps; ++k)
+        d2[k] = (oi[k] && oj[k]) ? distSq(ri[k], rj[k]) : std::numeric_limits<double>::infinity();
+
+    for (std::size_t k = 1; k + 1 < steps; ++k) {
+        if (!(d2[k] <= d2[k - 1] && d2[k] < d2[k + 1])) continue;
+        const double half = speed(vi[k], vj[k]) * stepSeconds * 0.5;
+        const double gate = std::sqrt(thr2 + half * half) + gateMarginKm;
+        if (d2[k] > gate * gate) continue;
+        out.push_back({i, j, k, std::sqrt(d2[k])});
+    }
+}
+
 std::optional<Conjunction> refineCandidate(
     const Candidate& c,
     const std::vector<libsgp4::SGP4>& propagators,
     const libsgp4::DateTime& start,
     double stepSeconds,
     double thresholdKm,
-    double toleranceSeconds = 1e-3)
-{
+    double toleranceSeconds = 1e-3 ) {
+
     const libsgp4::SGP4& A = propagators[c.first];
     const libsgp4::SGP4& B = propagators[c.second];
 
@@ -200,6 +307,7 @@ std::vector<Conjunction> refineAll(
 
 int main()
 {
+    const double thresholdKm = 25.0; // Define the threshold for conjunctions
     auto start = std::chrono::high_resolution_clock::now();
     std::vector<libsgp4::SGP4> propagators;
     std::vector<TLEData> tleDataList;
@@ -265,9 +373,9 @@ int main()
         std::cout << "SIZE : " << tleDataList.size();
         
         for (const auto &t : tleDataList) {
-            std::cout << "Satellite Name: " << t.name << std::endl;
-            std::cout << "Line 1: " << t.line1 << std::endl;
-            std::cout << "Line 2: " << t.line2 << std::endl;
+            //std::cout << "Satellite Name: " << t.name << std::endl;
+            //std::cout << "Line 1: " << t.line1 << std::endl;
+            //std::cout << "Line 2: " << t.line2 << std::endl;
             libsgp4::Tle tle(t.name, t.line1, t.line2); 
             libsgp4::SGP4 sgp4(tle);
             propagators.emplace_back(tle);
@@ -302,33 +410,55 @@ int main()
                 }
             }
         }
-        auto candidates = screenPairs(positions, velocities, valid, n, steps, stepSeconds, 10.0);
-        std::cout << candidates.size() << " candidate conjunctions found" << std::endl;
+        const double thr2 = thresholdKm * thresholdKm;
+       // std::vector<double> d2(steps);
+        const double radius = maxGateKm(velocities, valid, stepSeconds, thresholdKm, 10.0);
+       // auto pairs = candidatePairs(positions, valid, n, steps, radius);
+        auto startGrid = std::chrono::high_resolution_clock::now();
+        auto pairs = candidatePairs(positions, valid, n, steps, radius);
+        auto endGrid = std::chrono::high_resolution_clock::now();
+        auto gridDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endGrid - startGrid);
+        std::cout << "Grid screening time: " << gridDuration.count() << " milliseconds" << std::endl;
+        std::cout << "Grid sample size: " << pairs.size() << std::endl;
+        
+        // std::cout << "Grid screening found " << filtered.size() << " candidate conjunctions" << std::endl;
+        std::cout << "Propagation and screening completed." << std::endl;
 
-        auto endProp = std::chrono::high_resolution_clock::now();
-        auto propDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endProp - startProp);
-        std::cout << "Propagation time: " << propDuration.count() << " milliseconds" << std::endl;
-        std::cout << "Propagation position size : " << totalPropgationSteps << std::endl;
-        const double thresholdKm = 25.0; // Define the threshold for conjunctions
+        std::vector<double> d2(steps);
+        std::vector<Candidate> filtered;
 
-        //call refineAll to get the conjunctions
-        auto conjunctions = refineAll(candidates, propagators, start, stepSeconds, thresholdKm);
+        for (std::uint64_t key : pairs) {
+            const std::size_t i = key >> 32;               // top 32 bits
+            const std::size_t j = key & 0xFFFFFFFFu;       // bottom 32 bits
+            screenOnePair(i, j, positions, velocities, valid, steps,
+                        stepSeconds, thr2, 10.0, d2, filtered);
+                        
+            }
 
+        
+        auto conjunctions = refineAll(filtered, propagators, start, stepSeconds, thresholdKm);
         std::cout << conjunctions.size() << " conjunctions found" << std::endl;
-        for (const auto& conj : conjunctions) {
-            std::cout << "Conjunction between objects " << conj.first << " and " << conj.second << " at time " << conj.timeOfClosestApproach.ToString() << " with miss distance " << conj.missDistance << " km and relative speed " << conj.relativeSpeed << " km/s" << std::endl;
+        for(const auto& conj : conjunctions) {
+            unique_pairs.insert({conj.first, conj.second});
         }
-        // std::cout << "Position (ECI): " << pos.ToString() << std::endl;
+        std::cout << "Total unique conjunctions found: " << unique_pairs.size() << " Out of total " << filtered.size() << std::endl;
+        for(const auto& conj: conjunctions) {
+            std::cout << "Conjunction between objects " << conj.first << " and " << conj.second << std::endl
+            << "Miss distance: " << conj.missDistance << " km" << std::endl;
+            //std::cout << "Conjunction between objects " << conj.first << " and " << conj.second << std::endl;
+        }
+        
+        
     }
     else
     {
         std::cout << "GET request failed!" << std::endl;
     }
+    
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     std::cout << "Execution time: " << duration.count() << " milliseconds" << std::endl;
 
-   
-   
+
     return 0;
 }
