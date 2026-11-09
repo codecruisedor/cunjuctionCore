@@ -1,31 +1,28 @@
 #include "httplib.h"
 #include <vector>
-// #include "rapidjson/document.h"
-// #include "rapidjson/writer.h"
-// #include "rapidjson/stringbuffer.h"
 #include <iostream>
 #include <chrono>
 #include <libsgp4/SGP4.h>
 #include <libsgp4/Vector.h>
 #include <cmath>
 #include <cstddef>
-#include <libsgp4/Vector.h>
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
-#include <vector>
 
 std::set<std::pair<std::size_t, std::size_t>> unique_pairs;
 
-void createEarth() {
-
-}
 struct Candidate {
     std::size_t first,second;
     std::size_t minIndex;
     double distance;
+};
+struct finalConjunctionpairs {
+    std::size_t first,second;
+    double missDistance;
+    double relativeSpeed;
+    std::string firstId, secondId;
 };
 struct Conjunction {
     std::size_t first,second;
@@ -40,23 +37,7 @@ struct TLEData
     std::string line2;
 };
 
-// rapidjson::GenericArray<false, rapidjson::Value> parseJson(const std::string &jsonStr)
-// {
-//     rapidjson::Document doc;
-//     doc.Parse(jsonStr.c_str());
 
-//     if (doc.HasParseError())
-//     {
-//         std::cout << "Error parsing JSON" << std::endl;
-//         // return rapidjson::GenericArray<false, rapidjson::Value>(); // Return an empty array on parse error
-//     }
-
-//     // std::cout << "Number of elements in JSON array: " << doc.GetArray().Size() << std::endl;
-//     const auto &data = doc.GetArray();
-//     return data;
-// }
-
-// void parseJson(const std::string &jsonStr);
 inline double distSq(const libsgp4::Vector& a, const libsgp4::Vector& b) {
     const double dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
     return dx * dx + dy * dy + dz * dz;
@@ -175,7 +156,7 @@ std::vector<Candidate> screenPairs(
                 const libsgp4::Vector* vj = &velocities[j * steps];
                 const double vrel = speed(vi[k], vj[k]);
                 const double halfTravel = vrel * stepSeconds * 0.5;
-                const double gate = std::sqrt(thr2 + halfTravel * halfTravel) + gateMarginKm;
+                const double gate = std::sqrt(thr2 + ( halfTravel * halfTravel ) ) + gateMarginKm;
 
                 if (d2[k] > gate * gate) continue; // safe to discard
 
@@ -312,6 +293,9 @@ int main()
     std::vector<libsgp4::SGP4> propagators;
     std::vector<TLEData> tleDataList;
     std::unordered_map<std::string, std::int16_t> tleNameToIndex;
+    std::vector<finalConjunctionpairs> highRiskCandidates;
+    std::vector<finalConjunctionpairs> midRiskCandidates;
+    std::vector<finalConjunctionpairs> lowRiskCandidates;
 
     // Create an HTTP client pointing to the base domain
     httplib::Client cli("http://celestrak.org");
@@ -433,7 +417,7 @@ int main()
             screenOnePair(i, j, positions, velocities, valid, steps,
                         stepSeconds, thr2, 10.0, d2, filtered);
                         
-            }
+        }
 
         
         auto conjunctions = refineAll(filtered, propagators, start, stepSeconds, thresholdKm);
@@ -445,6 +429,16 @@ int main()
         for(const auto& conj: conjunctions) {
             std::cout << "Conjunction between objects " << conj.first << " and " << conj.second << std::endl
             << "Miss distance: " << conj.missDistance << " km" << std::endl;
+            if (conj.missDistance < 5.0) {
+                highRiskCandidates.emplace_back(conj.first, conj.second, conj.missDistance, conj.relativeSpeed, tleDataList[conj.first].name, tleDataList[conj.second].name);
+               // std::cout << "High risk conjunction!" << std::endl;
+            } else if (conj.missDistance > 5.0 && conj.missDistance < 15.0) {
+                midRiskCandidates.emplace_back(conj.first, conj.second, conj.missDistance, conj.relativeSpeed, tleDataList[conj.first].name, tleDataList[conj.second].name);
+              //  std::cout << "Medium risk conjunction!" << std::endl;
+            } else {
+                lowRiskCandidates.emplace_back(conj.first, conj.second, conj.missDistance, conj.relativeSpeed, tleDataList[conj.first].name, tleDataList[conj.second].name);
+               // std::cout << "Low risk conjunction." << std::endl;
+            }
             //std::cout << "Conjunction between objects " << conj.first << " and " << conj.second << std::endl;
         }
         
@@ -458,6 +452,10 @@ int main()
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     std::cout << "Execution time: " << duration.count() << " milliseconds" << std::endl;
+    std::cout << "High risk conjunctions: " << highRiskCandidates.size() << std::endl;
+    std::cout << "Medium risk conjunctions: " << midRiskCandidates.size() << std::endl;
+    std::cout << "Low risk conjunctions: " << lowRiskCandidates.size() << std::endl;
+    std::cout << "Total unique conjunctions: " << unique_pairs.size() << std::endl;
 
 
     return 0;
